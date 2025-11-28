@@ -16,11 +16,11 @@ This guide explains how to set up and manage **SFTP servers** using Docker. It c
         - [2. Dockerfile (Key-Only)](#2-dockerfile-key-only)
         - [3. Docker Compose (Key-Only)](#3-docker-compose-key-only)
         - [4. Deployment Steps](#4-deployment-steps-key-only)
-    - [**Scenario B: Hybrid SFTP Server (Key + Password)**](#scenario-b-hybrid-sftp-server-key--password)
-        - [1. Project Structure](#1-project-structure-hybrid)
-        - [2. Dockerfile (Hybrid)](#2-dockerfile-hybrid)
-        - [3. Docker Compose (Hybrid)](#3-docker-compose-hybrid)
-        - [4. Deployment Steps](#4-deployment-steps-hybrid)
+    - [**Scenario B: Multi-Factor SFTP Server (Username, Password, and SSH Key)**](#scenario-b-multi-factor-sftp-server-username-password-and-ssh-key)
+        - [1. Project Structure](#1-project-structure-multi-factor)
+        - [2. Dockerfile (Multi-Factor)](#2-dockerfile-multi-factor)
+        - [3. Docker Compose (Multi-Factor)](#3-docker-compose-multi-factor)
+        - [4. Deployment Steps](#4-deployment-steps-multi-factor)
 4. [SFTP Command-Line Reference](#sftp-command-line-reference)
 5. [Connecting via FileZilla](#connecting-via-filezilla)
 
@@ -216,20 +216,25 @@ services:
 ---
 
 
-### Scenario B: Hybrid SFTP Server (Key + Password)
+### Scenario B: Multi-Factor SFTP Server (Username, Password, and SSH Key)
 
-This setup requires both a valid SSH key and a password, adding a second layer of authentication.
+This setup requires **three distinct factors for authentication**:
+1.  A valid **Username**.
+2.  The **Password** associated with that username.
+3.  A valid **SSH Public Key**.
 
-#### 1. Project Structure (Hybrid)
+This provides a robust, multi-layered security approach, ensuring that only users with the correct key *and* password can access the SFTP server.
+
+#### 1. Project Structure (Multi-Factor)
 ```
-/sftp_hybrid/
+/sftp_multifactor/
 ├── docker-compose.yml
 ├── Dockerfile
 └── authorized_keys
 ```
 
-#### 2. Dockerfile (Hybrid)
-This `Dockerfile` creates a user and sets a password passed in during the build process.
+#### 2. Dockerfile (Multi-Factor)
+This `Dockerfile` creates a user, sets a password passed in during the build process, and configures SSH to require both public key and password authentication.
 
 **File: `Dockerfile`**
 ```dockerfile
@@ -241,14 +246,21 @@ RUN apt-get update && \
     mkdir /var/run/sshd
 
 # Create user and set password from build argument
-ARG USERNAME=hybriduser
-ARG PASSWORD=DefaultPasswordChangeMe
+ARG USERNAME=multifactoruser
+ARG PASSWORD=DefaultPasswordChangeMe!
 RUN useradd -m -s /bin/bash $USERNAME && \
     echo "$USERNAME:$PASSWORD" | chpasswd
 
-# --- SSH Configuration ---
-# Enable both public key and password authentication
+# --- SSH Configuration for Multi-Factor Authentication ---
+# 1. Ensure PubkeyAuthentication is enabled
+RUN sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+# 2. Ensure PasswordAuthentication is enabled
 RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+RUN sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# 3. Require both authentication methods
+RUN echo "\n# --- Custom Multi-Factor Auth Settings ---" >> /etc/ssh/sshd_config
 RUN echo "AuthenticationMethods publickey,password" >> /etc/ssh/sshd_config
 
 # Create .ssh directory for key mounting
@@ -261,39 +273,52 @@ EXPOSE 22
 CMD ["/usr/sbin/sshd","-D"]
 ```
 
-#### 3. Docker Compose (Hybrid)
-The `docker-compose.yml` file passes the username and password as build arguments.
+#### 3. Docker Compose (Multi-Factor)
+The `docker-compose.yml` file passes the username and password as build arguments, maps a host port, and mounts the necessary volumes.
 
 **File: `docker-compose.yml`**
 ```yaml
 version: '3.0'
 
 services:
-  sftp:
+  sftp-multifactor:
     build:
       context: .
       args:
-        USERNAME: hybriduser
-        PASSWORD: YourSuperStrongPassword123!
-    container_name: my-sftp-hybrid-server
+        USERNAME: multifactoruser
+        PASSWORD: YourSuperStrongPassword123! # <<< CHANGE THIS PASSWORD
+    container_name: my-sftp-multifactor-server
     ports:
-      - "2222:22"
+      - "2224:22" # Mapped to host port 2224
     volumes:
-      - ./authorized_keys:/home/hybriduser/.ssh/authorized_keys:ro
-      - ./sftp_data:/home/hybriduser/data
+      - ./authorized_keys:/home/multifactoruser/.ssh/authorized_keys:ro
+      - ./sftp_data:/home/multifactoruser/data
+    restart: unless-stopped
 ```
 
-#### 4. Deployment Steps (Hybrid)
+#### 4. Deployment Steps (Multi-Factor)
 
-1.  **Generate SSH Key:** Ensure you have an SSH key pair.
-2.  **Add Public Key:** Place the client's public key in the `authorized_keys` file.
-3.  **Set Password:** **Crucially, change the default `PASSWORD`** in your `docker-compose.yml` file to a strong, unique password.
-4.  **Set Permissions & Firewall:** Follow the same steps as in the key-only setup to set permissions for `sftp_data` and `authorized_keys`, and open port `2222` in your firewall.
-5.  **Build and Run:** `docker-compose up -d --build`
-6.  **Connect:**
+1.  **Generate a Dedicated SSH Key (Local Machine):**
     ```bash
-    # Replace the path to your private key and your server IP
-    sftp -i ~/.ssh/your_key -P 2222 hybriduser@YOUR_SERVER_IP
+    ssh-keygen -t rsa -b 4096 -f ~/.ssh/sftp_mfa_key
+    ```
+2.  **Add Public Key to Server:** Copy the content of your public key (`~/.ssh/sftp_mfa_key.pub`) and paste it into the `authorized_keys` file in your project directory (`sftp_multifactor/authorized_keys`).
+3.  **Set Password:** **Crucially, change the default `PASSWORD`** in your `docker-compose.yml` file (under `sftp-multifactor` service, `args` section) to a strong, unique password.
+4.  **Set Host Permissions:**
+    ```bash
+    # Create and set ownership for the data directory
+    mkdir -p sftp_data
+    sudo chown 1000:1000 sftp_data # UID 1000 for the created multifactoruser
+
+    # Set ownership and strict permissions for the key file
+    sudo chown 1000:1000 authorized_keys
+    sudo chmod 600 authorized_keys
+    ```
+5.  **Open Cloud Firewall:** Allow incoming TCP traffic on port `2224`.
+6.  **Build and Run:** `docker-compose up -d --build`
+7.  **Connect:**
+    ```bash
+    sftp -i ~/.ssh/sftp_mfa_key -P 2224 multifactoruser@YOUR_SERVER_IP
     ```
     You will be prompted for your SSH key passphrase (if any) and then for the user's password.
 
@@ -330,7 +355,7 @@ Once you are connected and see the `sftp>` prompt, use these commands.
 4. Port: The port you mapped (e.g., `2222`, `2223`).
 5. Logon Type:
     - For **Key-Only**: `Key file`.
-    - For **Hybrid**: `Interactive` (FileZilla will ask for both key and password).
+    - For **Multi-Factor (Username, Password, and SSH Key)**: `Interactive` (FileZilla will ask for both key and password).
 6. User: The username you configured (`sftpuser`, `hybriduser`, etc.).
 7. Key file: Browse and select your **private** key file.
 8. Connect
